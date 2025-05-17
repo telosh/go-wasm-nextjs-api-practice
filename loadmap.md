@@ -196,188 +196,204 @@ my-go-wasm-app/
 
 ### 4. Route Handler の作成
 
-App Routerを使用してAPIエンドポイントを作成します。`app/api/calculate/route.js` というファイルを作成し、以下の内容を記述します。
+App Routerを使用してAPIエンドポイントを作成します。`app/api/calculate/route.ts` というファイルを作成し、以下の内容を記述します。
 
-```javascript
-// app/api/calculate/route.js
+```TypeScript
+// app/api/calculate/route.ts
 import { NextResponse } from 'next/server';
 import fs from 'fs/promises';
 import path from 'path';
+import { webcrypto } from 'crypto'; // Node.js の crypto
+import { performance as nodePerformance } from 'perf_hooks'; // Node.js の performance
+
+// Wasm実行環境に必要なグローバルプロパティの型定義
+interface GoWasmGlobal {
+  Go: {
+    new (): {
+      importObject: WebAssembly.Imports;
+      run(instance: WebAssembly.Instance): Promise<void>;
+    };
+  };
+  goAdd: (a: number, b: number) => number | string;
+  // Node.js環境では、crypto と performance は globalThis に既に存在しうるが、
+  // Wasm実行や特定のライブラリが期待する型と異なる場合があるため、明示的に定義する。
+  crypto?: typeof webcrypto; // Node.js の webcrypto と互換性のある型
+  performance?: typeof nodePerformance; // Node.js の performance と互換性のある型
+}
 
 // Node.js環境でGo Wasmを実行するために必要なグローバルオブジェクトをセットアップ
-// wasm_exec.js が期待するオブジェクトを最小限用意する
-// Node.js v19以降では global.crypto が標準で利用可能ですが、それ以前のバージョン向け
-if (typeof global.crypto === 'undefined') {
-  const crypto = require('crypto');
-  global.crypto = crypto.webcrypto;
+// globalThis が GoWasmGlobal の形状を持つことを TypeScript に伝える
+const g = globalThis as unknown as GoWasmGlobal;
+
+if (typeof g.crypto === 'undefined') {
+  // webcrypto API を globalThis.crypto に設定
+  g.crypto = webcrypto;
 }
-if (typeof global.performance === 'undefined') {
-  const { performance } = require('perf_hooks');
-  global.performance = performance;
-}
-if (typeof global.TextEncoder === 'undefined') {
-  global.TextEncoder = require('util').TextEncoder;
-}
-if (typeof global.TextDecoder === 'undefined') {
-  global.TextDecoder = require('util').TextDecoder;
+if (typeof g.performance === 'undefined') {
+  // performance API を globalThis.performance に設定
+  // `as unknown as` は型互換性の問題を回避するために使用
+  g.performance = nodePerformance as unknown as GoWasmGlobal['performance'];
 }
 
-// グローバルスコープにGoインスタンスとWasmモジュールをキャッシュ
-// これにより、リクエスト間で初期化処理をスキップできる
-let goInstance;
-let wasmModule; // コンパイル済みWasmモジュール (インスタンス化に使用)
-let wasmInstance; // Wasmインスタンス (Goプログラムを実行)
+// WasmモジュールのインスタンスとGoのランタイムインスタンスを保持する変数
+let goRuntimeInstance: InstanceType<GoWasmGlobal['Go']>; // Goランタイムのインスタンス (go.runなどを呼び出すため)
+let wasmInstance: WebAssembly.Instance | null = null; // WebAssemblyのインスタンス (実際のWasmモジュール)
 
-// Wasmモジュールの初期化関数
-async function initializeWasm() {
+/**
+ * WebAssemblyモジュールを非同期で初期化します。
+ * 既に初期化済みの場合は何もしません。
+ * この関数は、Wasmモジュール内の 'goAdd' 関数が利用可能になるまで待機します。
+ */
+async function initializeWasm(): Promise<void> {
   if (wasmInstance) {
-    console.log('Wasm already initialized. Skipping.');
-    return; // 既に初期化済み
+    console.log('Wasmは既に初期化されています。スキップします。');
+    return;
   }
-  console.log('Initializing Wasm module...');
+  console.log('Wasmモジュールを初期化しています...');
 
   try {
-    // Node.js環境でwasm_exec.jsを読み込むための準備
-    // wasm_exec.jsはグローバルにGoオブジェクトを作成する
+    // wasm_exec.js のパス解決と読み込み
+    // このスクリプトはGoのWasmをブラウザやNode.jsで実行するためのランタイムを提供します。
     const wasmExecPath = path.resolve('./public/wasm_exec.js');
     const wasmExecContent = await fs.readFile(wasmExecPath, 'utf-8');
-
-    // Node.jsのグローバルスコープでwasm_exec.jsを実行する
-    // これにより global.Go が定義される
-    // new Function(code)() は eval と同様の挙動だが、セキュリティリスクを考慮し、
-    // 信頼できるコードでのみ使用すること。
-    // vmモジュールを使用する方がより安全な場合がある。
+    // `new Function` を使ってグローバルスコープで wasm_exec.js を実行
+    // これにより、globalThis.Go が定義されます。
     new Function(wasmExecContent)();
 
-    goInstance = new global.Go(); // global.Go は wasm_exec.js によって定義される
+    // Goコンストラクタの存在確認
+    if (typeof g.Go === 'undefined') {
+      throw new Error("GoコンストラクタがglobalThis上で見つかりません。wasm_exec.jsの実行に失敗した可能性があります。");
+    }
+    goRuntimeInstance = new g.Go(); // Goランタイムの新しいインスタンスを作成
 
+    // Wasmバイナリファイルのパス解決と読み込み
     const wasmFilePath = path.resolve('./public/main.go.wasm');
     const wasmBytes = await fs.readFile(wasmFilePath);
 
-    // Wasmモジュールをコンパイル・インスタンス化
-    const result = await WebAssembly.instantiate(wasmBytes, goInstance.importObject);
-    wasmModule = result.module;
-    wasmInstance = result.instance;
+    // Wasmモジュールのインスタント化
+    // WasmバイナリとGoランタイムのインポートオブジェクトを関連付けます。
+    const result = await WebAssembly.instantiate(wasmBytes, goRuntimeInstance.importObject);
+    wasmInstance = result.instance; // インスタント化されたWasmモジュールを保持
 
-    console.log('Wasm module instantiated.');
+    console.log('Wasmモジュールがインスタント化されました。');
 
-    // Goプログラムのmain関数を実行し、コールバック登録などを完了させる
-    // このPromiseはGoプログラムが終了するまで解決されないため、
-    // バックグラウンドで実行させ、完了を待たずに処理を進める。
-    goInstance.run(wasmInstance).catch(err => {
-      console.error("Go Wasm execution error:", err);
-      // エラー発生時はインスタンスを無効化し、再初期化を促す
-      wasmInstance = null;
-      goInstance = null;
+    // Goランタイムを開始し、Wasmモジュールを実行
+    // これは非同期処理であり、完了を待たずに次の処理に進むことがあります。
+    // Wasm内でのエラーはここでキャッチされます。
+    goRuntimeInstance.run(wasmInstance).catch((err: unknown) => {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      console.error("Go Wasmの実行時エラー:", errorMessage);
+      wasmInstance = null; // エラー発生時はインスタンスを無効化
     });
 
-    // Goの関数が登録されるのを待つ。
-    // より堅牢な方法としては、Go側から準備完了をJavaScriptに通知するコールバックを使用する。
-    // (例: Go側で js.Global().Call("onGoWasmReady") を呼び出す)
-    await new Promise(resolve => {
+    // 'goAdd'関数がグローバルスコープで利用可能になるまで待機
+    // Wasmモジュールの初期化が完了し、Go側でエクスポートされた関数が使えるようになるのを待ちます。
+    await new Promise<void>((resolve, reject) => {
+      const timeout = 5000; // タイムアウト時間を5秒に設定
+      const checkIntervalMs = 50;
+      let elapsedTime = 0;
+
       const checkInterval = setInterval(() => {
-        if (global.goAdd) {
+        if (typeof g.goAdd === 'function') {
           clearInterval(checkInterval);
-          console.log('goAdd function is available.');
+          console.log("'goAdd'関数が利用可能です。");
           resolve();
+        } else {
+          elapsedTime += checkIntervalMs;
+          if (elapsedTime >= timeout) {
+            clearInterval(checkInterval);
+            console.error("タイムアウト: 'goAdd'関数が利用可能になりませんでした。");
+            // Wasmの初期化に失敗したとみなし、インスタンスをクリアする
+            wasmInstance = null;
+            reject(new Error("タイムアウト: 'goAdd'関数の準備待機中にエラーが発生しました。Wasmモジュールの初期化に失敗した可能性があります。"));
+          }
         }
-      }, 50); // 50msごとに確認
-      setTimeout(() => { // タイムアウト処理
-        clearInterval(checkInterval);
-        if (!global.goAdd) {
-            console.error("Timeout: goAdd function did not become available.");
-        }
-        resolve(); // タイムアウトでもPromiseを解決して処理を続ける (エラー処理は呼び出し元で行う)
-      }, 2000); // 2秒のタイムアウト
+      }, checkIntervalMs);
     });
 
+    console.log('Go WasmがAPIルート用に初期化されました。');
 
-    console.log('Go Wasm Initialized for API.');
-
-  } catch (error) {
-    console.error('Error during Wasm initialization:', error);
-    // 初期化失敗時はインスタンスをクリア
-    wasmInstance = null;
-    goInstance = null;
-    throw error; // エラーを呼び出し元に伝える
+  } catch (error: unknown) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    console.error('Wasm初期化中のエラー:', errorMessage);
+    wasmInstance = null; // 初期化失敗時はインスタンスを無効化
+    // エラーを再スローして、呼び出し元で処理できるようにする
+    throw new Error(`Wasm初期化失敗: ${errorMessage}`);
   }
 }
 
-// アプリケーション起動時に一度だけWasmを初期化する (推奨)
-// initializeWasm().catch(err => {
-//   console.error("Failed to initialize Wasm on startup:", err);
-//   // 必要に応じてここでアプリケーションを終了するなどの処理を行う
-// });
-
-
-// Route Handler (POSTメソッドを処理)
-export async function POST(request) {
+// APIリクエストを処理するPOSTハンドラ
+export async function POST(request: Request): Promise<NextResponse> {
   try {
-    // リクエストごとに初期化を試みる (開発時や、サーバーレス環境でのコールドスタート時など)
-    // 本番環境では、サーバー起動時に一度だけ初期化する方が効率的
-    if (!wasmInstance) {
-        await initializeWasm();
+    // Wasmモジュールが初期化されているか、または 'goAdd' 関数が利用可能かを確認
+    if (!wasmInstance || typeof g.goAdd !== 'function') {
+      console.log("Wasmが未初期化または 'goAdd' が利用不可のため、初期化処理を実行します...");
+      await initializeWasm(); // Wasmモジュールを初期化
     }
 
-    if (!wasmInstance || typeof global.goAdd !== 'function') {
-        console.error("Wasm instance or goAdd function not available.");
-        return NextResponse.json({ error: 'Wasm module not ready or goAdd not found' }, { status: 503 }); // Service Unavailable
+    // 初期化後、再度 'goAdd' 関数の存在を確認
+    // initializeWasm内でエラーが発生した場合、wasmInstanceはnullになっているはず
+    if (!wasmInstance || typeof g.goAdd !== 'function') {
+      console.error("Wasmモジュールの準備ができていないか、'goAdd'関数が見つかりません（初期化試行後）。");
+      return NextResponse.json(
+        { error: "Wasmモジュールが利用できません。サーバー管理者にお問い合わせください。" },
+        { status: 503 } // Service Unavailable
+      );
     }
 
+    // リクエストボディから計算する数値を取得
     const body = await request.json();
     const { a, b } = body;
 
+    // 入力値の型チェック
     if (typeof a !== 'number' || typeof b !== 'number') {
-      return NextResponse.json({ error: 'Invalid input. "a" and "b" must be numbers.' }, { status: 400 });
+      return NextResponse.json(
+        { error: '無効な入力です。"a"と"b"は数値である必要があります。' },
+        { status: 400 } // Bad Request
+      );
     }
 
-    // JavaScriptからGoの関数を呼び出す
-    // 'goAdd' は main.go で js.Global().Set() を使って登録した名前
-    const result = global.goAdd(a, b);
+    // Wasmモジュール内の 'goAdd' 関数を呼び出し
+    const result = g.goAdd(a, b);
 
-    // Go関数からの戻り値の型を確認 (エラーメッセージの可能性もあるため)
+    // Go側で不正な入力として処理された場合の対応 (例: "Invalid input: ...")
     if (typeof result === 'string' && result.startsWith("Invalid")) {
-        return NextResponse.json({ error: result }, { status: 400 });
+        return NextResponse.json({ error: result }, { status: 400 }); // Bad Request
     }
 
-
+    // 計算結果をJSON形式でレスポンス
     return NextResponse.json({ result });
 
-  } catch (error) {
-    console.error('Error in /api/calculate:', error);
-    // initializeWasm 内でエラーがスローされた場合もここでキャッチされる
-    return NextResponse.json({ error: 'Internal Server Error', details: error.message }, { status: 500 });
+  } catch (error: unknown) {
+    // API処理中に発生した予期せぬエラーのハンドリング
+    const errorMessage = error instanceof Error ? error.message : "不明なエラーが発生しました。";
+    console.error('/api/calculate でのエラー:', errorMessage);
+    // Wasm初期化エラーの場合、より具体的なメッセージを返す
+    if (errorMessage.startsWith("Wasm初期化失敗:")) {
+        return NextResponse.json(
+            { error: 'Wasmモジュールの初期化に失敗しました。詳細はサーバーログをご確認ください。', details: errorMessage },
+            { status: 500 } // Internal Server Error
+        );
+    }
+    return NextResponse.json(
+      { error: '内部サーバーエラーが発生しました。処理中に予期せぬ問題が発生しました。', details: errorMessage },
+      { status: 500 } // Internal Server Error
+    );
   }
 }
 
-// 開発サーバーのホットリロードに関する注意点
-// Next.jsの開発モードでは、ファイル変更時にモジュールが再評価されることがあります。
-// グローバルにキャッシュされた wasmInstance や goInstance が古い状態のままになるか、
-// 意図せず再初期化される可能性があるため、注意が必要です。
-// initializeWasm 内の `if (wasmInstance)` チェックが重要になります。
+// 開発環境でのホットリロード時にログを出力
+// 注意: ホットリロードによりWasmモジュールの状態がリセットされることはないため、
+// 複数回の初期化試行や状態の不整合に注意が必要です。
 if (process.env.NODE_ENV === 'development') {
-    console.log("API route module (app/api/calculate/route.js) reloaded in development. Ensure Wasm state is managed correctly.");
+    console.log("APIルートモジュール (app/api/calculate/route.ts) が開発モードでリロードされました。Wasmの状態管理に注意してください。");
 }
 ```
 
 **コード解説:**
 
-*   **グローバルオブジェクトのセットアップ:** `wasm_exec.js` はブラウザ環境を前提としているため、Node.js環境で不足しているグローバルオブジェクト (`crypto`, `performance`, `TextEncoder`, `TextDecoder`) を事前に定義しています。Node.jsのバージョンによって必要なものが変わる可能性があります。
-*   **`wasm_exec.js`の実行:** `fs.readFile`で`wasm_exec.js`を読み込み、`new Function(code)()` を使ってグローバルスコープで実行します。これにより `global.Go` クラスが利用可能になります。
-    *   **注意:** `eval` や `new Function(code)()` の使用はセキュリティリスクを伴う可能性があります。信頼できるコードでのみ使用してください。より安全な代替手段としてNode.jsの `vm` モジュールを検討することもできますが、ここでは簡潔さを優先しています。
-*   **`initializeWasm` 関数:**
-    *   Wasmモジュールと `wasm_exec.js` を読み込み、Goのランタイムを初期化します。
-    *   `WebAssembly.instantiate(wasmBytes, goInstance.importObject)` でWasmモジュールをインスタンス化します。`goInstance.importObject` は `wasm_exec.js` が提供する、GoがJavaScriptの機能を使うために必要なオブジェクトです。
-    *   `goInstance.run(wasmInstance)` を呼び出すことで、Goの `main` 関数が実行され、`registerCallbacks` が呼び出されて `goAdd` 関数がJavaScript側にエクスポートされます。この `go.run` はPromiseを返し、Goプログラムが終了するまで解決されません。非同期に実行させます。
-    *   インスタンス化はコストがかかるため、`wasmInstance` と `goInstance` をグローバル変数にキャッシュして、初回リクエスト時またはサーバー起動時に一度だけ実行するようにしています。
-    *   `goAdd` 関数が利用可能になるまでポーリングで待機するロジックを追加し、タイムアウト処理も入れています。より堅牢なのはGo側からの通知です。
-*   **`POST` ハンドラ:**
-    *   リクエストボディから `a` と `b` を受け取ります。
-    *   `initializeWasm()` を呼び出し、Wasmモジュールが初期化されていることを保証します。
-    *   `global.goAdd(a, b)` のようにして、Goで定義しJavaScriptにエクスポートされた `goAdd` 関数を呼び出します。
-    *   Go関数がエラーメッセージ（文字列）を返した場合のハンドリングを追加しました。
-    *   結果をJSONで返します。
-*   **初期化戦略:** コメントアウトされている `initializeWasm().catch(...)` の部分は、アプリケーション起動時にWasmを初期化するアプローチです。これは本番環境では推奨されます。現在の実装ではリクエスト毎に初期化チェックを行っています。
+// TODO: コード解説 
+
 
 ## フェーズ3: 動作確認と発展
 
@@ -413,7 +429,7 @@ curl -X POST -H "Content-Type: application/json" -d '{"a": "hello", "b": 7}' htt
 ```
 期待されるレスポンス (Go側のエラーハンドリングによる):
 ```json
-{"error":"Argument 1 is not a valid integer"}
+{"error":"無効な入力です。\"a\"と\"b\"は数値である必要があります。"}
 ```
 
 コンソールには "Go WebAssembly Initialized (from Go)" や "Go Wasm Initialized for API."、"goAdd function is available." などのログが表示されるはずです。
